@@ -4,6 +4,8 @@
 
 It is designed for tmux panes and live monitoring while you work.
 
+![meter example](assets/example.png)
+
 ## Features
 
 - Stereo peak meter with ballistic envelope
