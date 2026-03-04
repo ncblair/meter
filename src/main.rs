@@ -145,7 +145,7 @@ fn coeff_from_ms(ms: f32, sample_rate: f32) -> f32 {
 
 fn parse_args() -> Result<AppConfig> {
     let mut input_device_name = DEFAULT_DEVICE_NAME.to_string();
-    let mut passthrough = false;
+    let mut passthrough = true;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--list-devices" || a == "-l") {
@@ -156,6 +156,8 @@ fn parse_args() -> Result<AppConfig> {
     for arg in &args {
         if arg == "--passthrough" || arg == "-p" {
             passthrough = true;
+        } else if arg == "--no-passthrough" {
+            passthrough = false;
         } else if !arg.starts_with('-') {
             input_device_name = arg.clone();
         }

@@ -11,4 +11,4 @@ if [[ ! -x "$BIN" ]] \
   (cd "$REPO" && cargo build --release)
 fi
 
-exec "$BIN" --passthrough "$@"
+exec "$BIN" "$@"
