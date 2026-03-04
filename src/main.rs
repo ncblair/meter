@@ -8,8 +8,8 @@ use cpal::{SampleFormat, StreamConfig};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use ringbuf::{HeapRb, traits::Consumer, traits::Producer, traits::Split};
 
@@ -17,6 +17,9 @@ const DEFAULT_DEVICE_NAME: &str = "music_out";
 const ATTACK_MS: f32 = 1.0;
 const RELEASE_MS: f32 = 200.0;
 const UI_FPS: u64 = 30;
+const DB_MIN: f32 = -60.0;
+const DB_MAX: f32 = 12.0;
+const METER_SEGMENTS: usize = 24;
 
 #[derive(Clone, Copy, Default)]
 struct Stereo {
@@ -591,23 +594,14 @@ fn render(frame: &mut Frame, cfg: &AppConfig, stereo: Stereo) {
             .title("Stereo Peak Meter"),
     );
 
-    let l_ratio = stereo.l.clamp(0.0, 1.0) as f64;
-    let r_ratio = stereo.r.clamp(0.0, 1.0) as f64;
-
     let l_db = amp_to_dbfs(stereo.l);
     let r_db = amp_to_dbfs(stereo.r);
 
-    let left = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title("Left"))
-        .gauge_style(meter_style(stereo.l))
-        .ratio(l_ratio)
-        .label(format!("{l_db:>6.1} dBFS"));
+    let left = Paragraph::new(meter_line("L", l_db))
+        .block(Block::default().borders(Borders::ALL).title("Left"));
 
-    let right = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title("Right"))
-        .gauge_style(meter_style(stereo.r))
-        .ratio(r_ratio)
-        .label(format!("{r_db:>6.1} dBFS"));
+    let right = Paragraph::new(meter_line("R", r_db))
+        .block(Block::default().borders(Borders::ALL).title("Right"));
 
     frame.render_widget(header, chunks[0]);
     frame.render_widget(left, chunks[1]);
@@ -619,14 +613,46 @@ fn amp_to_dbfs(amp: f32) -> f32 {
     20.0 * amp.max(min).log10()
 }
 
-fn meter_style(amp: f32) -> Style {
-    let color = if amp >= 0.89 {
-        Color::Red
-    } else if amp >= 0.7 {
+fn meter_line(label: &str, db: f32) -> Line<'static> {
+    let mut spans = Vec::with_capacity(METER_SEGMENTS + 2);
+    spans.push(Span::styled(
+        format!("{label} {db:>6.1} dBFS "),
+        Style::default().fg(Color::White),
+    ));
+
+    let lit = lit_segments_for_db(db);
+    for i in 0..METER_SEGMENTS {
+        let seg_db = DB_MIN + (i as f32 + 0.5) * ((DB_MAX - DB_MIN) / METER_SEGMENTS as f32);
+        let color = band_color(seg_db);
+        let style = if i < lit {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled("▮", style));
+    }
+
+    Line::from(spans)
+}
+
+fn lit_segments_for_db(db: f32) -> usize {
+    if db <= DB_MIN {
+        return 0;
+    }
+    if db >= DB_MAX {
+        return METER_SEGMENTS;
+    }
+
+    let norm = (db - DB_MIN) / (DB_MAX - DB_MIN);
+    (norm * METER_SEGMENTS as f32).floor() as usize
+}
+
+fn band_color(db: f32) -> Color {
+    if db < -18.0 {
+        Color::Green
+    } else if db < -6.0 {
         Color::Yellow
     } else {
-        Color::Green
-    };
-
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
+        Color::Red
+    }
 }

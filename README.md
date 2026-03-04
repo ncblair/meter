@@ -8,7 +8,9 @@ Terminal stereo peak meter for system audio loopback capture.
 - Tracks stereo peak envelopes with ballistics:
   - Attack: `1 ms`
   - Release: `200 ms`
-- Renders left/right meters in a TUI (tmux-friendly)
+- Renders left/right segmented LED-style meters in a TUI (tmux-friendly)
+- Meter scale is linear from `-60 dBFS` to `+12 dBFS` across 24 segments
+- Color bands: green `< -18 dB`, yellow `-18 to -6 dB`, red `>= -6 dB`
 - Optional in-app passthrough to the current default output device
 
 ## Setup (macOS + Rogue Amoeba Loopback)
