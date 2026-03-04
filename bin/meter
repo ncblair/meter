@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="$HOME/PROJECTS/2025/019_TUI_METER"
+BIN="$REPO/target/release/tui_meter"
+
+if [[ ! -x "$BIN" ]]; then
+  echo "meter: release binary not found at $BIN" >&2
+  echo "run: meter-build" >&2
+  exit 1
+fi
+
+exec "$BIN" --passthrough "$@"

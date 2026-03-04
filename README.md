@@ -2,6 +2,19 @@
 
 Terminal stereo peak meter for system audio loopback capture.
 
+## Install
+
+```bash
+./scripts/install.sh
+```
+
+Then:
+
+```bash
+meter-build
+meter
+```
+
 ## What this does
 
 - Captures audio from a named input device (default: `music_out`)
@@ -11,6 +24,7 @@ Terminal stereo peak meter for system audio loopback capture.
 - Renders left/right segmented LED-style meters in a TUI (tmux-friendly)
 - Meter scale is linear from `-60 dBFS` to `+12 dBFS` across 24 segments
 - Color bands: green `< -18 dB`, yellow `-18 to -6 dB`, red `>= -6 dB`
+- Adds a per-channel scrolling oscilloscope to the right of each meter
 - Optional in-app passthrough to the current default output device
 
 ## Setup (macOS + Rogue Amoeba Loopback)
@@ -25,6 +39,13 @@ Terminal stereo peak meter for system audio loopback capture.
 
 ```bash
 cargo run --release
+```
+
+Command shortcuts:
+
+```bash
+meter-build   # build/update release binary
+meter         # run meter with --passthrough
 ```
 
 Run with in-app passthrough:
@@ -60,3 +81,4 @@ Press `q` or `Esc` to quit.
 - Ballistic coefficients are precomputed once (no `exp` in hot path).
 - Stereo values are passed via a single `AtomicU64` packing both `f32` channels to avoid tearing.
 - Passthrough uses a lock-free ring buffer between input and output callbacks.
+- Scope data uses fixed-time min/max bins pushed over a lock-free queue, so scope behavior is independent of device block size.

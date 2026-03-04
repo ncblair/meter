@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="$HOME/PROJECTS/2025/019_TUI_METER"
+
+cd "$REPO"
+exec cargo build --release "$@"

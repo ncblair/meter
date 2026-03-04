@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -6,12 +7,13 @@ use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
-use ringbuf::{HeapRb, traits::Consumer, traits::Producer, traits::Split};
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 const DEFAULT_DEVICE_NAME: &str = "music_out";
 const ATTACK_MS: f32 = 1.0;
@@ -20,6 +22,9 @@ const UI_FPS: u64 = 30;
 const DB_MIN: f32 = -60.0;
 const DB_MAX: f32 = 12.0;
 const METER_SEGMENTS: usize = 24;
+const SCOPE_POINTS_PER_SEC: u32 = 240;
+const SCOPE_QUEUE_CAPACITY: usize = 32_768;
+const SCOPE_HISTORY_CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy, Default)]
 struct Stereo {
@@ -27,10 +32,65 @@ struct Stereo {
     r: f32,
 }
 
+#[derive(Clone, Copy, Default)]
+struct MinMax {
+    min: f32,
+    max: f32,
+}
+
+#[derive(Default)]
+struct ScopeHistory {
+    l: VecDeque<MinMax>,
+    r: VecDeque<MinMax>,
+}
+
 #[derive(Clone)]
 struct AppConfig {
     input_device_name: String,
     passthrough: bool,
+}
+
+struct ScopeBin {
+    target_samples: u32,
+    count: u32,
+    lmin: f32,
+    lmax: f32,
+    rmin: f32,
+    rmax: f32,
+}
+
+impl ScopeBin {
+    fn new(target_samples: u32) -> Self {
+        Self {
+            target_samples,
+            count: 0,
+            lmin: 0.0,
+            lmax: 0.0,
+            rmin: 0.0,
+            rmax: 0.0,
+        }
+    }
+
+    fn push_sample(&mut self, l: f32, r: f32, producer: &mut HeapProd<u64>) {
+        if self.count == 0 {
+            self.lmin = l;
+            self.lmax = l;
+            self.rmin = r;
+            self.rmax = r;
+        } else {
+            self.lmin = self.lmin.min(l);
+            self.lmax = self.lmax.max(l);
+            self.rmin = self.rmin.min(r);
+            self.rmax = self.rmax.max(r);
+        }
+
+        self.count += 1;
+        if self.count >= self.target_samples {
+            let packed = pack_scope_point(self.lmin, self.lmax, self.rmin, self.rmax);
+            let _ = producer.try_push(packed);
+            self.count = 0;
+        }
+    }
 }
 
 fn pack_stereo(s: Stereo) -> u64 {
@@ -43,6 +103,39 @@ fn unpack_stereo(v: u64) -> Stereo {
     let l = f32::from_bits((v >> 32) as u32);
     let r = f32::from_bits(v as u32);
     Stereo { l, r }
+}
+
+fn f32_to_i16(v: f32) -> i16 {
+    (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+fn i16_to_f32(v: i16) -> f32 {
+    (v as f32 / i16::MAX as f32).clamp(-1.0, 1.0)
+}
+
+fn pack_scope_point(lmin: f32, lmax: f32, rmin: f32, rmax: f32) -> u64 {
+    let a = f32_to_i16(lmin) as u16 as u64;
+    let b = f32_to_i16(lmax) as u16 as u64;
+    let c = f32_to_i16(rmin) as u16 as u64;
+    let d = f32_to_i16(rmax) as u16 as u64;
+    (a << 48) | (b << 32) | (c << 16) | d
+}
+
+fn unpack_scope_point(v: u64) -> (MinMax, MinMax) {
+    let lmin = i16_to_f32(((v >> 48) as u16) as i16);
+    let lmax = i16_to_f32(((v >> 32) as u16) as i16);
+    let rmin = i16_to_f32(((v >> 16) as u16) as i16);
+    let rmax = i16_to_f32((v as u16) as i16);
+    (
+        MinMax {
+            min: lmin,
+            max: lmax,
+        },
+        MinMax {
+            min: rmin,
+            max: rmax,
+        },
+    )
 }
 
 fn coeff_from_ms(ms: f32, sample_rate: f32) -> f32 {
@@ -78,7 +171,7 @@ fn main() -> Result<()> {
     let cfg = parse_args()?;
     let meter = Arc::new(AtomicU64::new(pack_stereo(Stereo::default())));
 
-    let (input_stream, output_stream) = build_audio(&cfg, Arc::clone(&meter))?;
+    let (input_stream, output_stream, scope_cons) = build_audio(&cfg, Arc::clone(&meter))?;
     input_stream
         .play()
         .context("failed to start audio input stream")?;
@@ -89,7 +182,7 @@ fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
-    let run_result = run_ui(&mut terminal, &cfg, &meter);
+    let run_result = run_ui(&mut terminal, &cfg, &meter, scope_cons);
     ratatui::restore();
 
     run_result
@@ -114,7 +207,7 @@ fn list_input_devices() -> Result<()> {
 fn build_audio(
     cfg: &AppConfig,
     meter: Arc<AtomicU64>,
-) -> Result<(cpal::Stream, Option<cpal::Stream>)> {
+) -> Result<(cpal::Stream, Option<cpal::Stream>, HeapCons<u64>)> {
     let host = cpal::default_host();
     let mut devices = host
         .input_devices()
@@ -137,6 +230,10 @@ fn build_audio(
     let attack_coeff = coeff_from_ms(ATTACK_MS, sample_rate);
     let release_coeff = coeff_from_ms(RELEASE_MS, sample_rate);
     let input_config: StreamConfig = supported_input.config();
+    let scope_bucket_samples = ((sample_rate / SCOPE_POINTS_PER_SEC as f32).round() as u32).max(1);
+
+    let scope_rb = HeapRb::<u64>::new(SCOPE_QUEUE_CAPACITY);
+    let (mut scope_prod, scope_cons) = scope_rb.split();
 
     let mut maybe_output_stream = None;
 
@@ -200,6 +297,7 @@ fn build_audio(
         match supported_input.sample_format() {
             SampleFormat::F32 => {
                 let mut state = Stereo::default();
+                let mut scope_bin = ScopeBin::new(scope_bucket_samples);
                 input_device.build_input_stream(
                     &input_config,
                     move |data: &[f32], _| {
@@ -213,6 +311,7 @@ fn build_audio(
                             |l, r| {
                                 let _ = producer.try_push(l);
                                 let _ = producer.try_push(r);
+                                scope_bin.push_sample(l, r, &mut scope_prod);
                             },
                         );
                     },
@@ -222,6 +321,7 @@ fn build_audio(
             }
             SampleFormat::I16 => {
                 let mut state = Stereo::default();
+                let mut scope_bin = ScopeBin::new(scope_bucket_samples);
                 input_device.build_input_stream(
                     &input_config,
                     move |data: &[i16], _| {
@@ -235,6 +335,7 @@ fn build_audio(
                             |l, r| {
                                 let _ = producer.try_push(l);
                                 let _ = producer.try_push(r);
+                                scope_bin.push_sample(l, r, &mut scope_prod);
                             },
                         );
                     },
@@ -244,6 +345,7 @@ fn build_audio(
             }
             SampleFormat::U16 => {
                 let mut state = Stereo::default();
+                let mut scope_bin = ScopeBin::new(scope_bucket_samples);
                 input_device.build_input_stream(
                     &input_config,
                     move |data: &[u16], _| {
@@ -257,6 +359,7 @@ fn build_audio(
                             |l, r| {
                                 let _ = producer.try_push(l);
                                 let _ = producer.try_push(r);
+                                scope_bin.push_sample(l, r, &mut scope_prod);
                             },
                         );
                     },
@@ -276,6 +379,7 @@ fn build_audio(
         match supported_input.sample_format() {
             SampleFormat::F32 => {
                 let mut state = Stereo::default();
+                let mut scope_bin = ScopeBin::new(scope_bucket_samples);
                 input_device.build_input_stream(
                     &input_config,
                     move |data: &[f32], _| {
@@ -286,7 +390,9 @@ fn build_audio(
                             release_coeff,
                             &mut state,
                             &meter,
-                            |_, _| {},
+                            |l, r| {
+                                scope_bin.push_sample(l, r, &mut scope_prod);
+                            },
                         );
                     },
                     in_err_fn,
@@ -295,6 +401,7 @@ fn build_audio(
             }
             SampleFormat::I16 => {
                 let mut state = Stereo::default();
+                let mut scope_bin = ScopeBin::new(scope_bucket_samples);
                 input_device.build_input_stream(
                     &input_config,
                     move |data: &[i16], _| {
@@ -305,7 +412,9 @@ fn build_audio(
                             release_coeff,
                             &mut state,
                             &meter,
-                            |_, _| {},
+                            |l, r| {
+                                scope_bin.push_sample(l, r, &mut scope_prod);
+                            },
                         );
                     },
                     in_err_fn,
@@ -314,6 +423,7 @@ fn build_audio(
             }
             SampleFormat::U16 => {
                 let mut state = Stereo::default();
+                let mut scope_bin = ScopeBin::new(scope_bucket_samples);
                 input_device.build_input_stream(
                     &input_config,
                     move |data: &[u16], _| {
@@ -324,7 +434,9 @@ fn build_audio(
                             release_coeff,
                             &mut state,
                             &meter,
-                            |_, _| {},
+                            |l, r| {
+                                scope_bin.push_sample(l, r, &mut scope_prod);
+                            },
                         );
                     },
                     in_err_fn,
@@ -338,7 +450,7 @@ fn build_audio(
     }
     .context("failed to build input stream")?;
 
-    Ok((input_stream, maybe_output_stream))
+    Ok((input_stream, maybe_output_stream, scope_cons))
 }
 
 fn apply_ballistics(input: f32, prev: f32, attack_coeff: f32, release_coeff: f32) -> f32 {
@@ -357,7 +469,7 @@ fn process_audio_f32(
     release_coeff: f32,
     state: &mut Stereo,
     meter: &AtomicU64,
-    mut push: impl FnMut(f32, f32),
+    mut on_frame: impl FnMut(f32, f32),
 ) {
     if channels == 0 {
         return;
@@ -367,13 +479,10 @@ fn process_audio_f32(
         let l = frame[0];
         let r = if channels > 1 { frame[1] } else { l };
 
-        let l_in = l.abs();
-        let r_in = r.abs();
+        state.l = apply_ballistics(l.abs(), state.l, attack_coeff, release_coeff);
+        state.r = apply_ballistics(r.abs(), state.r, attack_coeff, release_coeff);
 
-        state.l = apply_ballistics(l_in, state.l, attack_coeff, release_coeff);
-        state.r = apply_ballistics(r_in, state.r, attack_coeff, release_coeff);
-
-        push(l, r);
+        on_frame(l, r);
     }
 
     meter.store(pack_stereo(*state), Ordering::Relaxed);
@@ -386,7 +495,7 @@ fn process_audio_i16(
     release_coeff: f32,
     state: &mut Stereo,
     meter: &AtomicU64,
-    mut push: impl FnMut(f32, f32),
+    mut on_frame: impl FnMut(f32, f32),
 ) {
     if channels == 0 {
         return;
@@ -400,13 +509,10 @@ fn process_audio_i16(
             l
         };
 
-        let l_in = l.abs();
-        let r_in = r.abs();
+        state.l = apply_ballistics(l.abs(), state.l, attack_coeff, release_coeff);
+        state.r = apply_ballistics(r.abs(), state.r, attack_coeff, release_coeff);
 
-        state.l = apply_ballistics(l_in, state.l, attack_coeff, release_coeff);
-        state.r = apply_ballistics(r_in, state.r, attack_coeff, release_coeff);
-
-        push(l, r);
+        on_frame(l, r);
     }
 
     meter.store(pack_stereo(*state), Ordering::Relaxed);
@@ -419,7 +525,7 @@ fn process_audio_u16(
     release_coeff: f32,
     state: &mut Stereo,
     meter: &AtomicU64,
-    mut push: impl FnMut(f32, f32),
+    mut on_frame: impl FnMut(f32, f32),
 ) {
     if channels == 0 {
         return;
@@ -439,7 +545,7 @@ fn process_audio_u16(
         state.l = apply_ballistics(l.abs(), state.l, attack_coeff, release_coeff);
         state.r = apply_ballistics(r.abs(), state.r, attack_coeff, release_coeff);
 
-        push(l, r);
+        on_frame(l, r);
     }
 
     meter.store(pack_stereo(*state), Ordering::Relaxed);
@@ -544,11 +650,19 @@ fn write_frame_u16(frame: &mut [u16], l: f32, r: f32) {
     }
 }
 
-fn run_ui(terminal: &mut DefaultTerminal, cfg: &AppConfig, meter: &AtomicU64) -> Result<()> {
+fn run_ui(
+    terminal: &mut DefaultTerminal,
+    cfg: &AppConfig,
+    meter: &AtomicU64,
+    mut scope_cons: HeapCons<u64>,
+) -> Result<()> {
     let tick = Duration::from_millis(1_000 / UI_FPS);
     let mut last_draw = Instant::now();
+    let mut scope = ScopeHistory::default();
 
     loop {
+        drain_scope_queue(&mut scope_cons, &mut scope);
+
         if event::poll(Duration::from_millis(10)).context("event poll failed")? {
             if let Event::Key(key) = event::read().context("event read failed")? {
                 if key.kind == KeyEventKind::Press {
@@ -563,7 +677,7 @@ fn run_ui(terminal: &mut DefaultTerminal, cfg: &AppConfig, meter: &AtomicU64) ->
         if last_draw.elapsed() >= tick {
             let s = unpack_stereo(meter.load(Ordering::Relaxed));
             terminal
-                .draw(|frame| render(frame, cfg, s))
+                .draw(|frame| render(frame, cfg, s, &scope))
                 .context("terminal draw failed")?;
             last_draw = Instant::now();
         }
@@ -572,40 +686,72 @@ fn run_ui(terminal: &mut DefaultTerminal, cfg: &AppConfig, meter: &AtomicU64) ->
     Ok(())
 }
 
-fn render(frame: &mut Frame, cfg: &AppConfig, stereo: Stereo) {
+fn drain_scope_queue(scope_cons: &mut HeapCons<u64>, scope: &mut ScopeHistory) {
+    while let Some(packed) = scope_cons.try_pop() {
+        let (l, r) = unpack_scope_point(packed);
+
+        scope.l.push_back(l);
+        scope.r.push_back(r);
+
+        if scope.l.len() > SCOPE_HISTORY_CAPACITY {
+            let _ = scope.l.pop_front();
+        }
+        if scope.r.len() > SCOPE_HISTORY_CAPACITY {
+            let _ = scope.r.pop_front();
+        }
+    }
+}
+
+fn render(frame: &mut Frame, _cfg: &AppConfig, stereo: Stereo, scope: &ScopeHistory) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(frame.area());
-
-    let passthrough = if cfg.passthrough { "on" } else { "off" };
-    let header = Paragraph::new(Line::from(format!(
-        "In: {} | passthrough={} | q/esc quit | atk={}ms rel={}ms",
-        cfg.input_device_name, passthrough, ATTACK_MS as u32, RELEASE_MS as u32
-    )))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Stereo Peak Meter"),
-    );
 
     let l_db = amp_to_dbfs(stereo.l);
     let r_db = amp_to_dbfs(stereo.r);
 
-    let left = Paragraph::new(meter_line("L", l_db))
-        .block(Block::default().borders(Borders::ALL).title("Left"));
+    render_channel(frame, chunks[0], "Left", "L", l_db, &scope.l, Color::Green);
+    render_channel(frame, chunks[1], "Right", "R", r_db, &scope.r, Color::Green);
+}
 
-    let right = Paragraph::new(meter_line("R", r_db))
-        .block(Block::default().borders(Borders::ALL).title("Right"));
+fn render_channel(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    label: &str,
+    db: f32,
+    trace: &VecDeque<MinMax>,
+    scope_color: Color,
+) {
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(header, chunks[0]);
-    frame.render_widget(left, chunks[1]);
-    frame.render_widget(right, chunks[2]);
+    if inner.width < 8 || inner.height < 1 {
+        return;
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(40), Constraint::Min(8)])
+        .split(inner);
+
+    let meter_y = cols[0]
+        .y
+        .saturating_add(cols[0].height.saturating_sub(1) / 2);
+    let meter_rect = Rect {
+        x: cols[0].x,
+        y: meter_y,
+        width: cols[0].width,
+        height: 1,
+    };
+
+    frame.render_widget(Paragraph::new(meter_line(label, db)), meter_rect);
+
+    let scope_lines = scope_lines(trace, cols[1].width as usize, cols[1].height as usize);
+    let scope_paragraph = Paragraph::new(scope_lines).style(Style::default().fg(scope_color));
+    frame.render_widget(scope_paragraph, cols[1]);
 }
 
 fn amp_to_dbfs(amp: f32) -> f32 {
@@ -654,5 +800,85 @@ fn band_color(db: f32) -> Color {
         Color::Yellow
     } else {
         Color::Red
+    }
+}
+
+fn scope_lines(trace: &VecDeque<MinMax>, width: usize, height: usize) -> Vec<Line<'static>> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let sub_w = width * 2;
+    let sub_h = height * 4;
+    let mut dots = vec![vec![false; sub_w]; sub_h];
+
+    let center = sample_to_subrow(0.0, sub_h);
+    for x in 0..sub_w {
+        if x % 2 == 0 {
+            dots[center][x] = true;
+        }
+    }
+
+    let visible = width.min(trace.len());
+    let start = trace.len().saturating_sub(visible);
+    let x_offset = width - visible;
+
+    for (i, mm) in trace.iter().skip(start).enumerate() {
+        let x = (x_offset + i) * 2 + 1;
+        let top = sample_to_subrow(mm.max, sub_h);
+        let bottom = sample_to_subrow(mm.min, sub_h);
+        let y0 = top.min(bottom);
+        let y1 = top.max(bottom);
+
+        for row in dots.iter_mut().take(y1 + 1).skip(y0) {
+            row[x] = true;
+        }
+
+        if x > 0 {
+            dots[top][x - 1] = true;
+            dots[bottom][x - 1] = true;
+        }
+    }
+
+    let mut lines = Vec::with_capacity(height);
+    for cell_row in 0..height {
+        let mut line = String::with_capacity(width);
+        for cell_col in 0..width {
+            let mut bits: u8 = 0;
+            for dy in 0..4 {
+                for dx in 0..2 {
+                    if dots[cell_row * 4 + dy][cell_col * 2 + dx] {
+                        bits |= braille_bit(dx, dy);
+                    }
+                }
+            }
+            line.push(char::from_u32(0x2800 + bits as u32).unwrap_or(' '));
+        }
+        lines.push(Line::from(line));
+    }
+
+    lines
+}
+
+fn sample_to_subrow(sample: f32, sub_height: usize) -> usize {
+    if sub_height <= 1 {
+        return 0;
+    }
+
+    let y = (1.0 - sample.clamp(-1.0, 1.0)) * 0.5 * (sub_height as f32 - 1.0);
+    y.round() as usize
+}
+
+fn braille_bit(dx: usize, dy: usize) -> u8 {
+    match (dx, dy) {
+        (0, 0) => 0x01,
+        (0, 1) => 0x02,
+        (0, 2) => 0x04,
+        (1, 0) => 0x08,
+        (1, 1) => 0x10,
+        (1, 2) => 0x20,
+        (0, 3) => 0x40,
+        (1, 3) => 0x80,
+        _ => 0,
     }
 }
