@@ -1,0 +1,11 @@
+[package]
+name = "tui_meter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+cpal = "0.16"
+crossterm = "0.28"
+ratatui = "0.28"
+ringbuf = "0.4"
