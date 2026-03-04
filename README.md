@@ -1,84 +1,72 @@
-# tui_meter
+# meter
 
-Terminal stereo peak meter for system audio loopback capture.
+`meter` is a terminal audio meter + oscilloscope for macOS loopback devices.
 
-## Install
+It is designed for tmux panes and live monitoring while you work.
+
+## Features
+
+- Stereo peak meter with ballistic envelope
+  - Attack: 1 ms
+  - Release: 200 ms
+- LED-style meter scale
+  - Linear from -60 dBFS to +12 dBFS
+  - 24 segments
+  - Green / Yellow / Red threshold bands
+- Per-channel scrolling oscilloscope (min/max bucketed)
+- Optional passthrough to your default output (`--passthrough`)
+- Realtime-safe audio callbacks (no locks/allocations in the hot path)
+
+## Requirements
+
+- macOS
+- Rust toolchain (`cargo`)
+- A loopback input device (for example, Loopback or BlackHole)
+
+## Quick Start
+
+1. Clone this repo.
+2. Install command wrappers:
 
 ```bash
 ./scripts/install.sh
 ```
 
-Then:
+3. Build once:
 
 ```bash
 meter-build
+```
+
+4. Run:
+
+```bash
 meter
 ```
 
-## What this does
-
-- Captures audio from a named input device (default: `music_out`)
-- Tracks stereo peak envelopes with ballistics:
-  - Attack: `1 ms`
-  - Release: `200 ms`
-- Renders left/right segmented LED-style meters in a TUI (tmux-friendly)
-- Meter scale is linear from `-60 dBFS` to `+12 dBFS` across 24 segments
-- Color bands: green `< -18 dB`, yellow `-18 to -6 dB`, red `>= -6 dB`
-- Adds a per-channel scrolling oscilloscope to the right of each meter
-- Optional in-app passthrough to the current default output device
-
-## Setup (macOS + Rogue Amoeba Loopback)
-
-1. In Loopback, create virtual device `music_out`.
-2. Add the system audio source(s) you want to meter (or route app outputs into it).
-3. Set your system/app output path so audio is flowing through `music_out`.
-4. Ensure Terminal/iTerm has microphone/input permission in macOS Privacy settings.
-5. If you use `--passthrough`, you do not need a Loopback monitor path.
-
-## Build and run
+## Usage
 
 ```bash
-cargo run --release
+meter [input-device-name] [--passthrough]
 ```
 
-Command shortcuts:
+Examples:
 
 ```bash
-meter-build   # build/update release binary
-meter         # run meter with --passthrough
+meter
+meter music_out
+meter music_out --passthrough
 ```
 
-Run with in-app passthrough:
-
-```bash
-cargo run --release -- --passthrough
-```
-
-List available input devices:
+List input devices:
 
 ```bash
 cargo run --release -- --list-devices
 ```
 
-If you want a different input device name:
+Quit with `q` or `Esc`.
 
-```bash
-cargo run --release -- "My Device Name"
-```
+## Notes
 
-Or with passthrough and explicit input:
-
-```bash
-cargo run --release -- "My Device Name" --passthrough
-```
-
-Press `q` or `Esc` to quit.
-
-## Realtime notes
-
-- No locks in the audio callback.
-- No heap allocation in the callback.
-- Ballistic coefficients are precomputed once (no `exp` in hot path).
-- Stereo values are passed via a single `AtomicU64` packing both `f32` channels to avoid tearing.
-- Passthrough uses a lock-free ring buffer between input and output callbacks.
-- Scope data uses fixed-time min/max bins pushed over a lock-free queue, so scope behavior is independent of device block size.
+- `meter` wrapper does not auto-build. Run `meter-build` when code changes.
+- If your shell cannot find `meter`, reload your shell config (`source ~/.zshrc`) or open a new terminal.

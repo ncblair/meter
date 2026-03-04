@@ -6,8 +6,21 @@ DEST_DIR="${HOME}/.local/bin"
 
 mkdir -p "${DEST_DIR}"
 
-install -m 755 "${REPO_DIR}/bin/meter" "${DEST_DIR}/meter"
-install -m 755 "${REPO_DIR}/bin/meter-build" "${DEST_DIR}/meter-build"
+cat > "${DEST_DIR}/meter" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+REPO_DIR="${REPO_DIR}"
+exec "\${REPO_DIR}/bin/meter" "\$@"
+EOF
+
+cat > "${DEST_DIR}/meter-build" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+REPO_DIR="${REPO_DIR}"
+exec "\${REPO_DIR}/bin/meter-build" "\$@"
+EOF
+
+chmod +x "${DEST_DIR}/meter" "${DEST_DIR}/meter-build"
 
 cat <<MSG
 Installed:
