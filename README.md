@@ -16,6 +16,7 @@ It is designed for tmux panes and live monitoring while you work.
 - Per-channel scrolling oscilloscope (min/max bucketed)
 - Optional passthrough to your default output (`--passthrough`)
 - Realtime-safe audio callbacks (no locks/allocations in the hot path)
+- `meter` command auto-builds release binary when sources change
 
 ## Requirements
 
@@ -26,19 +27,13 @@ It is designed for tmux panes and live monitoring while you work.
 ## Quick Start
 
 1. Clone this repo.
-2. Install command wrappers:
+2. Install command wrapper:
 
 ```bash
 ./scripts/install.sh
 ```
 
-3. Build once:
-
-```bash
-meter-build
-```
-
-4. Run:
+3. Run:
 
 ```bash
 meter
@@ -68,5 +63,5 @@ Quit with `q` or `Esc`.
 
 ## Notes
 
-- `meter` wrapper does not auto-build. Run `meter-build` when code changes.
+- `meter` auto-builds on first run and when source files change.
 - If your shell cannot find `meter`, reload your shell config (`source ~/.zshrc`) or open a new terminal.
